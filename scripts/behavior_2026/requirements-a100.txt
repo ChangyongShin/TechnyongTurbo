@@ -1,0 +1,11 @@
+# Python 3.11. Install torch separately from the CUDA wheel index.
+numpy==1.26.4
+Pillow==11.3.0
+timm==1.0.19
+tqdm==4.67.1
+transformers==4.56.2
+huggingface-hub==0.34.4
+av==14.4.0
+pyarrow==19.0.1
+msgpack==1.1.1
+websockets==15.0.1

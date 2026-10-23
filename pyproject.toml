@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "turbovla"
 version = "0.1.0"
-description = "TurboVLA training and evaluation for LIBERO and RoboTwin 2.0"
+description = "TurboVLA training and evaluation for LIBERO, RoboTwin 2.0 and BEHAVIOR"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
@@ -19,6 +19,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+behavior = [
+  "av>=12.3",
+  "pyarrow>=14",
+  "huggingface-hub>=0.34,<1",
+  "msgpack>=1.1,<2",
+  "websockets>=15,<16",
+]
+
 libero = [
   "bddl",
   "cloudpickle",
@@ -54,7 +62,12 @@ dev = [
 ]
 
 [project.scripts]
-turbovla-libero-train = "turbovla.training.train_mixed:main"
+turbovla-behavior-download = "turbovla.data.download:main"
+turbovla-behavior-prepare = "turbovla.data.prepare:main"
+turbovla-behavior-preflight = "turbovla.training.preflight:main"
+turbovla-behavior-train = "turbovla.training.trainer:main"
+turbovla-behavior-serve = "turbovla.evaluation.serve:main"
+turbovla-train = "turbovla.training.trainer:main"
 turbovla-libero-eval = "vla_adapter.rollout:main"
 turbovla-robotwin-train = "experiments.robotwin.train:main"
 turbovla-robotwin-eval = "experiments.robotwin.evaluate:main"

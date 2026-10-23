@@ -21,11 +21,12 @@ class TextEncoderConfig:
 @dataclass
 class VisionEncoderConfig:
     model_name_or_path: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
-    image_size: int = 256
-    num_views: int = 2
+    image_size: int = 224
+    num_views: int = 3
+    input_channels: int = 3
     position_embedding: str = "view"
     encode_views_separately: bool = True
-    frozen: bool = False
+    frozen: bool = True
     local_files_only: bool = True
     attention_implementation: str | None = None
     compute_precision: str = "bf16_autocast"
@@ -52,8 +53,8 @@ class InteractionConfig:
 
 @dataclass
 class ActionHeadConfig:
-    action_dim: int = 7
-    state_dim: int = 8
+    action_dim: int = 23
+    state_dim: int = 61
     horizon: int = 12
     num_state_tokens: int = 2
     num_layers: int = 3
@@ -73,6 +74,8 @@ class TurboVLAConfig:
     def __post_init__(self) -> None:
         if self.name != "TurboVLA":
             raise ValueError(f"model name must be 'TurboVLA', got {self.name!r}")
+        if self.vision.input_channels not in (3, 4):
+            raise ValueError("input_channels must be 3 (RGB) or 4 (RGB-D)")
         if self.vision.num_views < 1:
             raise ValueError("vision.num_views must be positive")
         if self.vision.position_embedding not in {"view", "learned_patch"}:

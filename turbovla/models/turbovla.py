@@ -257,6 +257,7 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
                 model_name_or_path=_arg(args, "dinov3_path", _arg(args, "LOCAL_DINOV3_PATH", "")),
                 image_size=int(_arg(args, "image_size", _arg(args, "expected_image_size", 256))),
                 num_views=int(_arg(args, "num_views", 2)),
+                input_channels=int(_arg(args, "input_channels", 3)),
                 position_embedding=str(_arg(args, "position_embedding", "view")),
                 encode_views_separately=bool(_arg(args, "encode_views_separately", True)),
                 frozen=bool(_arg(args, "freeze_vision_encoder", False)),

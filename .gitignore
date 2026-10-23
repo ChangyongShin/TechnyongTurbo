@@ -5,6 +5,9 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .venv/
+.venv-behavior/
+.test-deps/
+.tools/
 venv/
 .env
 *.egg-info/

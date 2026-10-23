@@ -9,6 +9,18 @@ from transformers import AutoModel
 from .configuration import VisionEncoderConfig
 
 
+class RGBDPatchEmbedding(nn.Conv2d):
+    """Preserve frozen pretrained RGB weights while learning a separate depth kernel."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.depth_weight = nn.Parameter(torch.zeros_like(self.weight[:, :1]))
+
+    def forward(self, value):
+        weight = torch.cat((self.weight[:, :3], self.depth_weight), dim=1)
+        return self._conv_forward(value, weight, self.bias)
+
+
 def _load_pretrained_model(config: VisionEncoderConfig):
     kwargs = {
         "local_files_only": config.local_files_only,
@@ -49,12 +61,49 @@ class DINOv3VisionEncoder(nn.Module):
         self.prefix_tokens = self._prefix_tokens(self.backbone.config, default=5)
         self.num_patches = (config.image_size // self.patch_size) ** 2
 
+        if config.input_channels == 4:
+            self._expand_rgbd_input()
+
         embeddings = getattr(self.backbone, "embeddings", None)
         mask_token = getattr(embeddings, "mask_token", None)
         if mask_token is not None:
             mask_token.requires_grad_(False)
         if config.frozen:
             self.backbone.requires_grad_(False)
+            if config.input_channels == 4:
+                # Zero depth weights must learn; freezing them would permanently
+                # ignore depth. Only the added kernel trains in the frozen recipe.
+                self.rgbd_patch.depth_weight.requires_grad_(True)
+
+    def _expand_rgbd_input(self) -> None:
+        # HF DINOv3 uses a Conv2d directly, not patch_embeddings.projection.
+        embeddings = getattr(self.backbone, "embeddings", None)
+        patch = getattr(embeddings, "patch_embeddings", None)
+        if isinstance(patch, nn.Conv2d):
+            parent, name = embeddings, "patch_embeddings"
+        elif isinstance(getattr(patch, "projection", None), nn.Conv2d):
+            parent, name = patch, "projection"
+        else:
+            parent = getattr(self.backbone, "patch_embed", None)
+            name = "proj"
+        old = getattr(parent, name, None)
+        if not isinstance(old, nn.Conv2d) or old.in_channels != 3 or old.groups != 1:
+            raise ValueError("RGB-D requires a three-channel, ungrouped Conv2d patch embedding")
+        new = RGBDPatchEmbedding(
+            4, old.out_channels, old.kernel_size, old.stride, old.padding,
+            dilation=old.dilation, groups=1, bias=old.bias is not None,
+            padding_mode=old.padding_mode,
+        ).to(device=old.weight.device, dtype=old.weight.dtype)
+        with torch.no_grad():
+            new.weight[:, :3].copy_(old.weight)
+            # Preserve the pretrained RGB function at initialization.
+            new.weight[:, 3:].zero_()
+            if old.bias is not None:
+                new.bias.copy_(old.bias)
+        setattr(parent, name, new)
+        # Avoid registering the same module twice in checkpoint state_dict.
+        object.__setattr__(self, "rgbd_patch", new)
+        self.backbone.config.num_channels = 4
 
     @staticmethod
     def _hidden_size(config) -> int:
@@ -103,7 +152,7 @@ class DINOv3VisionEncoder(nn.Module):
         if precision == "bf16_autocast" and pixel_values.device.type == "cuda":
             autocast_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-        grad_context = torch.no_grad() if self.config.frozen else nullcontext()
+        grad_context = torch.no_grad() if self.config.frozen and self.config.input_channels == 3 else nullcontext()
         with grad_context:
             with autocast_context:
                 outputs = self.backbone(pixel_values=pixel_values, output_hidden_states=True)
@@ -118,8 +167,8 @@ class DINOv3VisionEncoder(nn.Module):
         )
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        if pixel_values.ndim != 5:
-            raise ValueError(f"pixel_values must be [B,V,3,H,W], got {tuple(pixel_values.shape)}")
+        if pixel_values.ndim != 5 or pixel_values.shape[2] != self.config.input_channels:
+            raise ValueError(f"pixel_values must be [B,V,{self.config.input_channels},H,W], got {tuple(pixel_values.shape)}")
         batch_size, num_views = pixel_values.shape[:2]
         if num_views != self.config.num_views:
             raise ValueError(f"expected {self.config.num_views} views, got {num_views}")

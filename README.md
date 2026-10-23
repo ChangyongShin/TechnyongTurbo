@@ -80,6 +80,18 @@ cd TurboVLA
 
 LIBERO and RoboTwin use different simulator and data stacks. We recommend separate Python 3.10 environments.
 
+### BEHAVIOR 2026 (A100 training)
+
+See [the A100 setup guide](experiments/behavior_2026/A100_SETUP_KO.md) for the
+RGB/RGB-D implementation in the core `turbovla.data`, `turbovla.training` and `turbovla.evaluation` modules, pinned Linux setup, selective LeRobot-v3 downloads,
+disk-backed caches and a websocket policy server for separate RTX evaluation.
+The default R1Pro interface uses 23 actions, 61 state fields and three cameras.
+Run `python -m turbovla.training.trainer --help` or, after installation,
+`turbovla-behavior-train --help`. Download, prepare, preflight and serve use the same
+module/command naming pattern. Legacy `experiments.behavior_2026` commands forward
+to the core modules.
+
+
 ### LIBERO Environment
 
 ```bash
