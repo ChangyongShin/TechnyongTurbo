@@ -31,6 +31,8 @@ def main():
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--rgbd", action="store_true")
+    parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"],
+                        default=os.environ.get("WANDB_MODE", "online"))
     args = parser.parse_args()
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("This entry point is single-GPU; launch with python, not multi-process torchrun")
@@ -133,39 +135,67 @@ def main():
             raise FloatingPointError("Nonfinite loss")
         return loss, error.detach().sum((0, 1)), mask.sum().detach()
 
-    iterator = iter(train)
-    for step in range(start_step + 1, args.steps + 1):
-        model.train()
-        # Keep the frozen visual backbone deterministic.
-        model.vision_encoder.backbone.eval()
-        optimizer.zero_grad(set_to_none=True)
-        logged_loss = 0.0
-        for _ in range(args.grad_accumulation):
-            try:
-                batch = next(iterator)
-            except StopIteration:
-                iterator = iter(train)
-                batch = next(iterator)
-            loss, _, _ = loss_for(batch)
-            (loss / args.grad_accumulation).backward()
-            logged_loss += loss.item() / args.grad_accumulation
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
-        optimizer.step()
-        if step == 1 or step % 50 == 0:
-            print(json.dumps({"step": step, "train_l1": logged_loss}), flush=True)
-        if step % args.save_every == 0 or step == args.steps:
-            model.eval()
-            total = torch.zeros(23, device=args.device)
-            count = torch.zeros((), device=args.device)
-            with torch.inference_mode():
-                for batch in validation:
-                    _, error, valid = loss_for(batch)
-                    total += error
-                    count += valid
-            print(json.dumps({"step": step, "validation_l1_per_action": (total / count).cpu().tolist()}), flush=True)
-            temporary = args.out / f"step_{step}.pt.tmp"
-            torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step, **metadata}, temporary)
-            temporary.replace(args.out / f"step_{step}.pt")
+    from contextlib import nullcontext
+    tracking = nullcontext(None)
+    if args.wandb_mode != "disabled":
+        import wandb
+        tracking = wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "TechnyongTurbo"),
+            entity=os.environ.get("WANDB_ENTITY"),
+            name=os.environ.get("WANDB_NAME") or args.out.name,
+            mode=args.wandb_mode,
+            config={**{k: str(v) if isinstance(v, Path) else
+                       [str(p) for p in v] if isinstance(v, list) else v
+                       for k, v in vars(args).items()},
+                    "train_episode_ids": train_ids, "validation_episode_ids": val_ids,
+                    "start_step": start_step, "resolved_precision": precision,
+                    "effective_batch_size": args.batch_size * args.grad_accumulation},
+        )
+    with tracking as run:
+        if run is not None:
+            run.define_metric("train_step")
+            run.define_metric("train/*", step_metric="train_step")
+            run.define_metric("validation/*", step_metric="train_step")
+        iterator = iter(train)
+        for step in range(start_step + 1, args.steps + 1):
+            model.train()
+            # Keep the frozen visual backbone deterministic.
+            model.vision_encoder.backbone.eval()
+            optimizer.zero_grad(set_to_none=True)
+            logged_loss = 0.0
+            for _ in range(args.grad_accumulation):
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    iterator = iter(train)
+                    batch = next(iterator)
+                loss, _, _ = loss_for(batch)
+                (loss / args.grad_accumulation).backward()
+                logged_loss += loss.item() / args.grad_accumulation
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+            optimizer.step()
+            if run is not None:
+                run.log({"train_step": step, "train/l1": logged_loss,
+                         "train/lr": optimizer.param_groups[0]["lr"]})
+            if step == 1 or step % 50 == 0:
+                print(json.dumps({"step": step, "train_l1": logged_loss}), flush=True)
+            if step % args.save_every == 0 or step == args.steps:
+                model.eval()
+                total = torch.zeros(23, device=args.device)
+                count = torch.zeros((), device=args.device)
+                with torch.inference_mode():
+                    for batch in validation:
+                        _, error, valid = loss_for(batch)
+                        total += error
+                        count += valid
+                values = (total / count).cpu().tolist()
+                print(json.dumps({"step": step, "validation_l1_per_action": values}), flush=True)
+                if run is not None:
+                    run.log({"train_step": step, "validation/l1_mean": sum(values) / len(values),
+                             **{f"validation/action_{i:02d}_l1": v for i, v in enumerate(values)}})
+                temporary = args.out / f"step_{step}.pt.tmp"
+                torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step, **metadata}, temporary)
+                temporary.replace(args.out / f"step_{step}.pt")
 
 
 train_model = main

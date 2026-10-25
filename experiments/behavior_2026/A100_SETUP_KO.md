@@ -82,6 +82,17 @@ prepare 실패로 생긴 미완료 episode 디렉터리는 완료 metadata가 �
 
 ## 3. 한 step 학습 → 작은 학습
 
+학습기는 기본적으로 W&B에 자동 기록한다. 최초 한 번 `wandb login`으로
+로그인한다. 기본 프로젝트는 `TechnyongTurbo`, 실행 이름은 `RUN_DIR`의 마지막
+폴더 이름이다. `WANDB_ENTITY`, `WANDB_PROJECT`, `WANDB_NAME`으로 변경할 수 있다.
+매 optimizer step의 `train/l1`, `train/lr`와 검증 시점의 `validation/l1_mean`,
+23개 `validation/action_XX_l1`를 학습 step 기준으로 기록하고 학습 설정과
+episode split을 저장한다. 체크포인트 파일은 로컬 output 경로에 저장한다.
+재개 시에는 시작 step을 기록한 새 W&B run을 만든다.
+오프라인 기록은 `WANDB_MODE=offline`, 기록을 끄려면 `WANDB_MODE=disabled`로
+실행한다. W&B 초기화 실패 시 오류를 표시하므로 인증과 네트워크를 확인한다.
+학습 실패 시에도 W&B run은 실패 상태로 종료된다.
+
 ```bash
 export TRAIN_EPISODES="0 1"
 export VAL_EPISODES="2"

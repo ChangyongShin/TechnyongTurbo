@@ -114,7 +114,8 @@ class RGBDModelTests(unittest.TestCase):
             command = [sys.executable, "-m", "turbovla.training.trainer", "--train", str(paths[0]),
                        "--validation", str(paths[1]), "--dinov3", str(vision_path), "--bert", str(text_path),
                        "--out", str(output), "--steps", "1", "--batch-size", "1", "--horizon", "2",
-                       "--image-size", "16", "--device", "cpu", "--vision-precision", "fp32", "--rgbd"]
+                       "--image-size", "16", "--device", "cpu", "--vision-precision", "fp32", "--rgbd",
+                       "--wandb-mode", "disabled"]
             environment = dict(os.environ, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", HF_HUB_OFFLINE="1")
             completed = subprocess.run(command, cwd=Path(__file__).parents[1], env=environment,
                                        capture_output=True, text=True, timeout=120)
