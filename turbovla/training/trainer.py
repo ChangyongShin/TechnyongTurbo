@@ -12,8 +12,12 @@ from turbovla.evaluation.observations import ACTION_ORDER
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--train", type=Path, nargs="+", required=True)
-    parser.add_argument("--validation", type=Path, nargs="+", required=True)
+    parser.add_argument("--train", type=Path, nargs="+")
+    parser.add_argument("--validation", type=Path, nargs="+")
+    parser.add_argument("--split-manifest", type=Path)
+    parser.add_argument("--task-balanced", action="store_true")
+    parser.add_argument("--reference-config", type=Path,
+                        help="Baseline config.json defining a fixed action evaluation scale")
     parser.add_argument("--dinov3", required=True)
     parser.add_argument("--bert", required=True)
     parser.add_argument("--out", type=Path, required=True)
@@ -34,6 +38,15 @@ def main():
     parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"],
                         default=os.environ.get("WANDB_MODE", "online"))
     args = parser.parse_args()
+    manifest = None
+    if args.split_manifest:
+        if args.train or args.validation:
+            raise ValueError("Use --split-manifest or explicit episode paths, not both")
+        manifest = json.loads(args.split_manifest.read_text(encoding="utf-8"))
+        args.train = [Path(p) for p in manifest["train_paths"]]
+        args.validation = [Path(p) for p in manifest["validation_paths"]]
+    if not args.train or not args.validation:
+        raise ValueError("Nonempty training and validation paths are required")
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("This entry point is single-GPU; launch with python, not multi-process torchrun")
     import torch
@@ -89,9 +102,34 @@ def main():
     model.to(args.device)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     modality = "rgbd" if args.rgbd else "rgb"
-    train = DataLoader(BehaviorDataset(args.train, normalizer, preprocessing, args.horizon, modality), batch_size=args.batch_size,
-                       shuffle=True, num_workers=args.workers, pin_memory=device.type == "cuda")
-    validation = DataLoader(BehaviorDataset(args.validation, normalizer, preprocessing, args.horizon, modality), batch_size=args.batch_size,
+    train_dataset = BehaviorDataset(args.train, normalizer, preprocessing, args.horizon, modality)
+    validation_dataset = BehaviorDataset(args.validation, normalizer, preprocessing, args.horizon, modality)
+    from turbovla.data.multitask import TaskBalancedSampler, reference_action_l1
+    from turbovla.data.preprocessing import Normalizer
+    sampler = TaskBalancedSampler(train_dataset.episodes, args.seed) if args.task_balanced else None
+    if args.task_balanced:
+        training_tasks = {int(e["task_id"]) for e in train_dataset.episodes}
+        validation_tasks = {int(e.get("task_id", -1)) for e in validation_dataset.episodes}
+        if training_tasks != validation_tasks:
+            raise ValueError("Task-balanced runs require the same tasks in train and validation")
+    if manifest:
+        for paths, episodes, split_key in ((args.train, train_dataset.episodes, "train"),
+                                           (args.validation, validation_dataset.episodes, "validation")):
+            for path, episode in zip(paths, episodes):
+                task = str(int(episode["task_id"]))
+                entry = manifest["tasks"][task]
+                if int(episode["episode_id"]) not in entry[split_key]:
+                    raise ValueError(f"Cache does not match task manifest: {path}")
+                if (episode.get("source") or {}).get("revision") != manifest["revision"]:
+                    raise ValueError(f"Cache dataset revision mismatch: {path}")
+    reference = None
+    reference_metadata = None
+    if args.reference_config:
+        reference_metadata = json.loads(args.reference_config.read_text(encoding="utf-8"))
+        reference = Normalizer(**reference_metadata["normalization"])
+    train = DataLoader(train_dataset, batch_size=args.batch_size,
+                       shuffle=sampler is None, sampler=sampler, num_workers=args.workers, pin_memory=device.type == "cuda")
+    validation = DataLoader(validation_dataset, batch_size=args.batch_size,
                             num_workers=args.workers, pin_memory=device.type == "cuda")
     args.out.mkdir(parents=True, exist_ok=True)
     metadata = {"model_config": config.to_dict(), "normalization": normalizer.to_dict(),
@@ -101,7 +139,12 @@ def main():
                                                             "scale": 10.0} if args.rgbd else None,
                 "action_order": ACTION_ORDER, "seed": args.seed,
                 "training": {"batch_size": args.batch_size, "grad_accumulation": args.grad_accumulation,
-                             "lr": args.lr, "workers": args.workers}}
+                             "lr": args.lr, "workers": args.workers,
+                             "task_balanced": args.task_balanced}}
+    if manifest:
+        metadata["split_manifest"] = manifest
+    if reference is not None:
+        metadata["reference_normalization"] = reference.to_dict()
     start_step = 0
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
@@ -110,6 +153,8 @@ def main():
                 raise ValueError(f"Resume contract changed: {key}")
         if "data_sources" in checkpoint and checkpoint["data_sources"] != metadata["data_sources"]:
             raise ValueError("Resume dataset provenance changed")
+        if checkpoint.get("training", {}).get("task_balanced", False) != args.task_balanced:
+            raise ValueError("Resume sampling strategy changed")
         previous_config = checkpoint["model_config"]
         # Backbone paths may change when a run moves between servers.
         for section in ("vision", "text"):
@@ -123,7 +168,7 @@ def main():
             raise ValueError("--steps must exceed the resumed optimizer step")
     (args.out / "config.json").write_text(json.dumps(metadata, indent=2))
 
-    def loss_for(batch):
+    def loss_for(batch, details=False):
         prediction = model(batch["instruction"], batch["images"].to(args.device), batch["state"].to(args.device))
         target = batch["actions"].to(args.device)
         mask = batch["mask"].to(args.device)[..., None]
@@ -133,6 +178,12 @@ def main():
         loss = error.sum() / (mask.sum().clamp_min(1) * 23)
         if not torch.isfinite(loss):
             raise FloatingPointError("Nonfinite loss")
+        if details:
+            reference_error = None
+            if reference is not None:
+                reference_error = reference_action_l1(
+                    prediction, batch["raw_actions"].to(args.device), mask, normalizer, reference)
+            return error.detach().sum(1), mask.sum(1).squeeze(-1), reference_error
         return loss, error.detach().sum((0, 1)), mask.sum().detach()
 
     from contextlib import nullcontext
@@ -157,6 +208,8 @@ def main():
             run.define_metric("train/*", step_metric="train_step")
             run.define_metric("validation/*", step_metric="train_step")
         iterator = iter(train)
+        from collections import Counter
+        sampled_tasks = Counter()
         for step in range(start_step + 1, args.steps + 1):
             model.train()
             # Keep the frozen visual backbone deterministic.
@@ -170,29 +223,59 @@ def main():
                     iterator = iter(train)
                     batch = next(iterator)
                 loss, _, _ = loss_for(batch)
+                sampled_tasks.update(batch["task_id"].tolist())
                 (loss / args.grad_accumulation).backward()
                 logged_loss += loss.item() / args.grad_accumulation
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
             optimizer.step()
             if run is not None:
                 run.log({"train_step": step, "train/l1": logged_loss,
-                         "train/lr": optimizer.param_groups[0]["lr"]})
+                         "train/lr": optimizer.param_groups[0]["lr"],
+                         **{f"train/task_{task:03d}_sample_fraction": n / sum(sampled_tasks.values())
+                            for task, n in sampled_tasks.items()}})
             if step == 1 or step % 50 == 0:
                 print(json.dumps({"step": step, "train_l1": logged_loss}), flush=True)
             if step % args.save_every == 0 or step == args.steps:
                 model.eval()
                 total = torch.zeros(23, device=args.device)
                 count = torch.zeros((), device=args.device)
+                by_task = {}
                 with torch.inference_mode():
                     for batch in validation:
-                        _, error, valid = loss_for(batch)
-                        total += error
-                        count += valid
+                        error, valid, reference_error = loss_for(batch, details=True)
+                        total += error.sum(0)
+                        count += valid.sum()
+                        for task in batch["task_id"].unique().tolist():
+                            chosen = (batch["task_id"] == task).to(args.device)
+                            if task not in by_task:
+                                by_task[task] = [torch.zeros(23, device=args.device),
+                                                 torch.zeros((), device=args.device),
+                                                 torch.zeros(23, device=args.device)]
+                            by_task[task][0] += error[chosen].sum(0)
+                            by_task[task][1] += valid[chosen].sum()
+                            if reference_error is not None:
+                                by_task[task][2] += reference_error[chosen].sum(0)
                 values = (total / count).cpu().tolist()
                 print(json.dumps({"step": step, "validation_l1_per_action": values}), flush=True)
+                task_metrics = {}
+                task_means = []
+                for task, (task_error, task_count, ref_error) in sorted(by_task.items()):
+                    task_values = (task_error / task_count).cpu().tolist()
+                    task_mean = sum(task_values) / len(task_values)
+                    task_means.append(task_mean)
+                    result = {"step": step, "task_id": task, "validation_l1_per_action": task_values}
+                    task_metrics[f"validation/task_{task:03d}/l1_mean"] = task_mean
+                    for i, value in enumerate(task_values):
+                        task_metrics[f"validation/task_{task:03d}/action_{i:02d}_l1"] = value
+                    if reference is not None:
+                        ref_values = (ref_error / task_count).cpu().tolist()
+                        result["reference_l1_per_action"] = ref_values
+                        task_metrics[f"validation/task_{task:03d}/reference_l1_mean"] = sum(ref_values) / 23
+                    print(json.dumps(result), flush=True)
+                task_metrics["validation/task_macro_l1_mean"] = sum(task_means) / len(task_means)
                 if run is not None:
                     run.log({"train_step": step, "validation/l1_mean": sum(values) / len(values),
-                             **{f"validation/action_{i:02d}_l1": v for i, v in enumerate(values)}})
+                             **{f"validation/action_{i:02d}_l1": v for i, v in enumerate(values)}, **task_metrics})
                 temporary = args.out / f"step_{step}.pt.tmp"
                 torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step, **metadata}, temporary)
                 temporary.replace(args.out / f"step_{step}.pt")

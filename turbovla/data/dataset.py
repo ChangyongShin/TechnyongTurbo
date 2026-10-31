@@ -80,6 +80,8 @@ class BehaviorDataset:
             "state": self.normalizer.state(data["states"][t]),
             "actions": self.normalizer.action(chunk), "mask": mask,
             "instruction": data["instruction"],
+            "task_id": int(np.asarray(data.get("task_id", -1)).item()),
+            "raw_actions": chunk,
         }
 
 
