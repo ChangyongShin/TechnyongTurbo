@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import http
+import json
 import logging
 
 import msgpack
@@ -45,15 +46,27 @@ def unpack(value):
 
 
 class PolicyServer:
-    def __init__(self, policy, instructions, rgb_keys=RGB_KEYS, state_key=STATE_KEY, depth_keys=DEPTH_KEYS):
+    def __init__(self, policy, instructions, rgb_keys=RGB_KEYS, state_key=STATE_KEY, depth_keys=DEPTH_KEYS,
+                 trace_writer=None):
         self.policy, self.instructions = policy, instructions
         self.rgb_keys, self.state_key = rgb_keys, state_key
         self.depth_keys = depth_keys
         self.lock = asyncio.Lock()
+        self.trace_writer = trace_writer
+        from turbovla.evaluation.diagnostics import object_sha256
+        self.metadata = {"policy": "TurboVLA", "action_dim": 23, "state_dim": 61,
+                         **getattr(policy, "deployment_metadata", {}),
+                         "rgb_keys": list(rgb_keys), "state_key": state_key,
+                         "task_instructions_sha256": object_sha256(instructions),
+                         "task_0_instruction": instructions.get(0)}
+        if trace_writer is not None:
+            self.policy.trace_enabled = True
 
     def dispatch(self, observation):
         if "reset" in observation:
             self.policy.reset()
+            if self.trace_writer is not None:
+                self.trace_writer.reset()
             return None  # Official client does not recv a reset acknowledgement.
         rgb, state, instruction = map_observation(observation, self.instructions, self.rgb_keys, self.state_key)
         rgbd = getattr(self.policy, "input_channels", 3) == 4
@@ -62,6 +75,11 @@ class PolicyServer:
         action = np.asarray(result["action"], dtype=np.float32)
         if action.shape != (23,) or not np.isfinite(action).all():
             raise ValueError("Policy must return finite action[23]")
+        if self.trace_writer is not None:
+            self.trace_writer.write(self.policy.last_trace, instruction=instruction,
+                                    task_id=int(np.asarray(observation["task_id"]).item()), camera_keys=self.rgb_keys)
+            if self.trace_writer.count >= self.trace_writer.limit:
+                self.policy.trace_enabled = False
         return {"action": action}
 
     async def handler(self, websocket):
@@ -71,7 +89,7 @@ class PolicyServer:
             return
         async with self.lock:
             self.policy.reset()
-            await websocket.send(pack({"policy": "TurboVLA", "action_dim": 23, "state_dim": 61}))
+            await websocket.send(pack(self.metadata))
             try:
                 async for message in websocket:
                     result = self.dispatch(unpack(message))
@@ -102,11 +120,18 @@ def main():
     parser.add_argument("--rgb-keys", nargs=3, default=RGB_KEYS)
     parser.add_argument("--state-key", default=STATE_KEY)
     parser.add_argument("--depth-keys", nargs=3, default=DEPTH_KEYS)
+    parser.add_argument("--trace-dir", help="New directory for bounded diagnostic traces (adds latency)")
+    parser.add_argument("--trace-limit", type=int, default=64)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     policy = BehaviorPolicy.from_checkpoint(args.checkpoint, args.device, args.execute_steps,
                                             dinov3=args.dinov3, bert=args.bert)
     server = PolicyServer(policy, load_tasks(args.data_root), args.rgb_keys, args.state_key, args.depth_keys)
+    if args.trace_dir:
+        from turbovla.evaluation.diagnostics import TraceWriter
+        server.trace_writer = TraceWriter(args.trace_dir, server.metadata, args.trace_limit)
+        policy.trace_enabled = True
+    logging.info("Deployment identity: %s", json.dumps(server.metadata, ensure_ascii=False))
 
     async def run():
         async with serve(server.handler, args.host, args.port, compression=None, max_size=32 * 1024 * 1024,
