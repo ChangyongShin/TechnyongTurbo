@@ -16,6 +16,12 @@ def main():
     parser.add_argument("--validation", type=Path, nargs="+")
     parser.add_argument("--split-manifest", type=Path)
     parser.add_argument("--task-balanced", action="store_true")
+    parser.add_argument("--staged", action="store_true", help="Visual-language motion decision conditioning")
+    parser.add_argument("--phase-balanced", action="store_true")
+    parser.add_argument("--group-balanced-loss", action="store_true")
+    parser.add_argument("--decision-weight", type=float, default=.1)
+    parser.add_argument("--decision-pretrain-steps", type=int, default=0)
+    parser.add_argument("--temporal-weight", type=float, default=0.)
     parser.add_argument("--reference-config", type=Path,
                         help="Baseline config.json defining a fixed action evaluation scale")
     parser.add_argument("--dinov3", required=True)
@@ -70,6 +76,11 @@ def main():
         raise ValueError("steps, batch size, horizon and lr must be positive")
     if args.resume and args.initial_weights:
         raise ValueError("Use either --resume or --initial-weights")
+    if min(args.decision_weight, args.temporal_weight) < 0:
+        raise ValueError("Auxiliary loss weights must be nonnegative")
+    if args.decision_pretrain_steps < 0 or (args.decision_pretrain_steps and
+            (not args.staged or args.decision_pretrain_steps >= args.steps)):
+        raise ValueError("Decision pretraining requires --staged and fewer steps than total training")
     if args.out.exists() and any(args.out.iterdir()):
         raise FileExistsError("Use a new output directory; checkpoints are not overwritten")
     train_ids = [int(load_episode(p)["episode_id"]) for p in args.train]
@@ -86,7 +97,8 @@ def main():
         "vision": {"model_name_or_path": args.dinov3, "num_views": 3, "input_channels": 4 if args.rgbd else 3,
                    "image_size": args.image_size, "frozen": True, "local_files_only": True,
                    "compute_precision": precision},
-        "action": {"action_dim": 23, "state_dim": 61, "horizon": args.horizon},
+        "action": {"action_dim": 23, "state_dim": 61, "horizon": args.horizon,
+                   "decision_conditioning": args.staged},
     })
     model = build_turbovla(config)
     if args.initial_weights:
@@ -102,11 +114,15 @@ def main():
     model.to(args.device)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     modality = "rgbd" if args.rgbd else "rgb"
-    train_dataset = BehaviorDataset(args.train, normalizer, preprocessing, args.horizon, modality)
-    validation_dataset = BehaviorDataset(args.validation, normalizer, preprocessing, args.horizon, modality)
+    from turbovla.data.stages import PhaseDataset, PhaseBalancedSampler, PHASES, PHASE_SPEC
+    dataset_type = PhaseDataset if args.staged or args.phase_balanced else BehaviorDataset
+    train_dataset = dataset_type(args.train, normalizer, preprocessing, args.horizon, modality)
+    validation_dataset = dataset_type(args.validation, normalizer, preprocessing, args.horizon, modality)
     from turbovla.data.multitask import TaskBalancedSampler, reference_action_l1
     from turbovla.data.preprocessing import Normalizer
     sampler = TaskBalancedSampler(train_dataset.episodes, args.seed) if args.task_balanced else None
+    if args.phase_balanced:
+        sampler = PhaseBalancedSampler(train_dataset, args.seed, args.task_balanced)
     if args.task_balanced:
         training_tasks = {int(e["task_id"]) for e in train_dataset.episodes}
         validation_tasks = {int(e.get("task_id", -1)) for e in validation_dataset.episodes}
@@ -140,7 +156,16 @@ def main():
                 "action_order": ACTION_ORDER, "seed": args.seed,
                 "training": {"batch_size": args.batch_size, "grad_accumulation": args.grad_accumulation,
                              "lr": args.lr, "workers": args.workers,
-                             "task_balanced": args.task_balanced}}
+                             "task_balanced": args.task_balanced, "phase_balanced": args.phase_balanced,
+                             "group_balanced_loss": args.group_balanced_loss,
+                             "decision_weight": args.decision_weight, "temporal_weight": args.temporal_weight}}
+    metadata["training"]["decision_pretrain_steps"] = args.decision_pretrain_steps
+    if args.staged or args.phase_balanced:
+        metadata["phase_spec"] = PHASE_SPEC
+        metadata["train_phase_counts"] = np.bincount(np.concatenate(train_dataset.labels), minlength=4).tolist()
+        metadata["validation_phase_counts"] = np.bincount(np.concatenate(validation_dataset.labels), minlength=4).tolist()
+        print(json.dumps({"phases": PHASES, "train_counts": metadata["train_phase_counts"],
+                          "validation_counts": metadata["validation_phase_counts"]}), flush=True)
     if manifest:
         metadata["split_manifest"] = manifest
     if reference is not None:
@@ -155,11 +180,17 @@ def main():
             raise ValueError("Resume dataset provenance changed")
         if checkpoint.get("training", {}).get("task_balanced", False) != args.task_balanced:
             raise ValueError("Resume sampling strategy changed")
+        for key, default in (("phase_balanced", False), ("group_balanced_loss", False),
+                             ("decision_weight", .1), ("temporal_weight", 0.), ("decision_pretrain_steps", 0)):
+            if checkpoint.get("training", {}).get(key, default) != metadata["training"][key]:
+                raise ValueError(f"Resume training objective changed: {key}")
+        if checkpoint.get("phase_spec") != metadata.get("phase_spec"):
+            raise ValueError("Resume motion-phase specification changed")
         previous_config = checkpoint["model_config"]
         # Backbone paths may change when a run moves between servers.
         for section in ("vision", "text"):
             previous_config[section]["model_name_or_path"] = metadata["model_config"][section]["model_name_or_path"]
-        if previous_config != metadata["model_config"]:
+        if TurboVLAConfig.from_mapping(previous_config).to_dict() != metadata["model_config"]:
             raise ValueError("Resume model configuration changed")
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -168,14 +199,37 @@ def main():
             raise ValueError("--steps must exceed the resumed optimizer step")
     (args.out / "config.json").write_text(json.dumps(metadata, indent=2))
 
-    def loss_for(batch, details=False):
-        prediction = model(batch["instruction"], batch["images"].to(args.device), batch["state"].to(args.device))
+    last_components = {}
+    def loss_for(batch, details=False, decision_only=False):
+        inputs = (batch["instruction"], batch["images"].to(args.device), batch["state"].to(args.device))
+        if args.staged:
+            prediction, decision_logits = model.forward_with_decision(*inputs)
+        else:
+            prediction, decision_logits = model(*inputs), None
         target = batch["actions"].to(args.device)
         mask = batch["mask"].to(args.device)[..., None]
         if prediction.shape != target.shape:
             raise ValueError(f"Action shape mismatch: {prediction.shape} vs {target.shape}")
         error = (prediction - target).abs() * mask
         loss = error.sum() / (mask.sum().clamp_min(1) * 23)
+        if args.group_balanced_loss:
+            loss = torch.stack([error[..., a:b].sum() / (mask.sum().clamp_min(1) * (b-a))
+                                for a, b in ACTION_ORDER.values()]).mean()
+        control_loss = loss
+        decision_loss = torch.zeros((), device=args.device)
+        if decision_logits is not None:
+            decision_loss = torch.nn.functional.cross_entropy(decision_logits, batch["phase"].to(args.device))
+            loss = loss + args.decision_weight * decision_loss
+        temporal_loss = torch.zeros((), device=args.device)
+        if args.temporal_weight and prediction.shape[1] > 1:
+            pair_mask = mask[:, 1:] * mask[:, :-1]
+            delta_error = (prediction[:, 1:] - prediction[:, :-1] - target[:, 1:] + target[:, :-1]).abs()
+            temporal_loss = (delta_error * pair_mask).sum() / (pair_mask.sum().clamp_min(1) * 23)
+            loss = loss + args.temporal_weight * temporal_loss
+        last_components.update(control_l1=float(control_loss.detach()), decision_ce=float(decision_loss.detach()),
+                               temporal_delta_l1=float(temporal_loss.detach()))
+        if decision_only:
+            loss = decision_loss
         if not torch.isfinite(loss):
             raise FloatingPointError("Nonfinite loss")
         if details:
@@ -183,7 +237,7 @@ def main():
             if reference is not None:
                 reference_error = reference_action_l1(
                     prediction, batch["raw_actions"].to(args.device), mask, normalizer, reference)
-            return error.detach().sum(1), mask.sum(1).squeeze(-1), reference_error
+            return error.detach().sum(1), mask.sum(1).squeeze(-1), reference_error, decision_logits
         return loss, error.detach().sum((0, 1)), mask.sum().detach()
 
     from contextlib import nullcontext
@@ -216,35 +270,51 @@ def main():
             model.vision_encoder.backbone.eval()
             optimizer.zero_grad(set_to_none=True)
             logged_loss = 0.0
+            components = {"control_l1": 0., "decision_ce": 0., "temporal_delta_l1": 0.}
             for _ in range(args.grad_accumulation):
                 try:
                     batch = next(iterator)
                 except StopIteration:
                     iterator = iter(train)
                     batch = next(iterator)
-                loss, _, _ = loss_for(batch)
+                loss, _, _ = loss_for(batch, decision_only=args.staged and step <= args.decision_pretrain_steps)
+                for name in components:
+                    components[name] += last_components[name] / args.grad_accumulation
                 sampled_tasks.update(batch["task_id"].tolist())
                 (loss / args.grad_accumulation).backward()
                 logged_loss += loss.item() / args.grad_accumulation
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
             optimizer.step()
             if run is not None:
-                run.log({"train_step": step, "train/l1": logged_loss,
+                run.log({"train_step": step, "train/l1": components["control_l1"], "train/loss_total": logged_loss,
+                         **{f"train/{name}": value for name, value in components.items()},
                          "train/lr": optimizer.param_groups[0]["lr"],
                          **{f"train/task_{task:03d}_sample_fraction": n / sum(sampled_tasks.values())
                             for task, n in sampled_tasks.items()}})
             if step == 1 or step % 50 == 0:
-                print(json.dumps({"step": step, "train_l1": logged_loss}), flush=True)
+                print(json.dumps({"step": step, "train_l1": components["control_l1"], "loss_total": logged_loss,
+                                  "decision_only": args.staged and step <= args.decision_pretrain_steps,
+                                  **components}), flush=True)
             if step % args.save_every == 0 or step == args.steps:
                 model.eval()
                 total = torch.zeros(23, device=args.device)
                 count = torch.zeros((), device=args.device)
                 by_task = {}
+                phase_totals = {i: [torch.zeros(23, device=args.device), torch.zeros((), device=args.device)] for i in range(4)}
+                confusion = torch.zeros(4, 4, dtype=torch.long, device=args.device)
                 with torch.inference_mode():
                     for batch in validation:
-                        error, valid, reference_error = loss_for(batch, details=True)
+                        error, valid, reference_error, decision_logits = loss_for(batch, details=True)
                         total += error.sum(0)
                         count += valid.sum()
+                        if "phase" in batch:
+                            truth = batch["phase"].to(args.device)
+                            for phase in range(4):
+                                chosen = truth == phase
+                                phase_totals[phase][0] += error[chosen].sum(0)
+                                phase_totals[phase][1] += valid[chosen].sum()
+                            if decision_logits is not None:
+                                confusion += torch.bincount(truth * 4 + decision_logits.argmax(-1), minlength=16).reshape(4, 4)
                         for task in batch["task_id"].unique().tolist():
                             chosen = (batch["task_id"] == task).to(args.device)
                             if task not in by_task:
@@ -258,6 +328,16 @@ def main():
                 values = (total / count).cpu().tolist()
                 print(json.dumps({"step": step, "validation_l1_per_action": values}), flush=True)
                 task_metrics = {}
+                for phase, (phase_error, phase_count) in phase_totals.items():
+                    if phase_count.item() > 0:
+                        per_axis = phase_error / phase_count
+                        task_metrics[f"validation/phase_{PHASES[phase]}/l1_mean"] = float(per_axis.mean())
+                        for group, (a, b) in ACTION_ORDER.items():
+                            task_metrics[f"validation/phase_{PHASES[phase]}/{group}_l1"] = float(per_axis[a:b].mean())
+                if args.staged:
+                    task_metrics["validation/decision_accuracy"] = float(confusion.diag().sum() / confusion.sum().clamp_min(1))
+                    print(json.dumps({"step": step, "decision_confusion_matrix": confusion.cpu().tolist(),
+                                      "phase_metrics": task_metrics}), flush=True)
                 task_means = []
                 for task, (task_error, task_count, ref_error) in sorted(by_task.items()):
                     task_values = (task_error / task_count).cpu().tolist()

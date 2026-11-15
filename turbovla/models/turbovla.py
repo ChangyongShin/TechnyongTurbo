@@ -134,6 +134,11 @@ class TurboVLA(nn.Module):
             nheads=config.interaction.nheads,
             dim_feedforward=config.interaction.dim_feedforward,
         )
+        if config.action.decision_conditioning:
+            # Visual/language context -> motion intent -> conditioned control.
+            # These are supervised motion phases, not object detections/planner states.
+            self.decision_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, 4))
+            self.decision_embedding = nn.Linear(4, hidden_dim, bias=False)
 
     def _normalize_samples(self, samples: torch.Tensor | Mapping[str, torch.Tensor]) -> torch.Tensor:
         if isinstance(samples, Mapping):
@@ -200,9 +205,23 @@ class TurboVLA(nn.Module):
         samples: torch.Tensor | Mapping[str, torch.Tensor],
         state: torch.Tensor,
     ) -> torch.Tensor:
+        if self.config.action.decision_conditioning:
+            return self.forward_with_decision(instructions, samples, state)[0]
         condition = self.encode_condition(instructions, samples)
         action_dtype = self.action_head.decoder.action_queries.weight.dtype
         return self.action_head(condition.to(dtype=action_dtype), state.to(dtype=action_dtype))
+
+    def forward_with_decision(self, instructions, samples, state):
+        if not self.config.action.decision_conditioning:
+            raise ValueError("This checkpoint has no decision head")
+        condition = self.encode_condition(instructions, samples)
+        dtype = self.action_head.decoder.action_queries.weight.dtype
+        condition = condition.to(dtype=dtype)
+        logits = self.decision_head(condition.mean(dim=1))
+        intent = self.decision_embedding(logits.softmax(dim=-1)).unsqueeze(1)
+        # Always use predicted intent, including during training (no teacher-forcing leak).
+        action = self.action_head(torch.cat([condition, intent], dim=1), state.to(dtype=dtype))
+        return action, logits
 
     # Transitional read-only names used only by legacy checkpoint initialization.
     @property

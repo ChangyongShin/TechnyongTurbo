@@ -61,6 +61,7 @@ class ActionHeadConfig:
     mlp_hidden_dim: int = 512
     state_hidden_dim: int = 256
     dropout: float = 0.1
+    decision_conditioning: bool = False
 
 
 @dataclass

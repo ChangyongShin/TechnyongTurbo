@@ -82,10 +82,17 @@ class BehaviorPolicy:
             normalized_state = self.normalizer.state(state)
             device = next(self.model.parameters()).device
             with torch.inference_mode():
-                predicted = self.model(
+                inputs = (
                     [instruction], torch.from_numpy(images[None]).to(device),
                     torch.from_numpy(normalized_state[None]).to(device),
-                )[0].float().cpu().numpy()
+                )
+                decision_probabilities = None
+                if getattr(getattr(self.model.config, "action", None), "decision_conditioning", False):
+                    output, decision_logits = self.model.forward_with_decision(*inputs)
+                    decision_probabilities = decision_logits.softmax(-1)[0].float().cpu().numpy()
+                else:
+                    output = self.model(*inputs)
+                predicted = output[0].float().cpu().numpy()
             if predicted.shape != (self.model.chunk_size, 23):
                 raise ValueError("Invalid predicted action chunk")
             actions = self.normalizer.inverse_action(predicted)
@@ -99,6 +106,8 @@ class BehaviorPolicy:
                                      "denormalized_chunk": actions.copy()}
                 self._trace_chunk.update({f"camera_{i}_raw": np.asarray(value).copy()
                                           for i, value in enumerate(rgb)})
+                if decision_probabilities is not None:
+                    self._trace_chunk["decision_probabilities"] = decision_probabilities
         action = np.asarray(self.queue.popleft(), dtype=np.float32)
         if self.trace_enabled:
             self.last_trace = {**self._trace_chunk, "request_state_raw": np.asarray(state).copy(),
