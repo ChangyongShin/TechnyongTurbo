@@ -99,7 +99,40 @@ PYTHONPATH="$PWD" /workspace/TechnyongTurbo/.venv-behavior/bin/python -m turbovl
 다른 split이면 그 파일의 처음 두 TRAIN과 처음 한 VAL을 사용하고 실제 ID를 출력한다.
 launcher는 cached task_id·episode_id·원본 revision을 확인한다.
 
+## task 0 전체 에피소드로 전환
+
+`scripts/behavior_2026/run_task0_full_staged.sh`는 기존 baseline config에 저장된
+180개 TRAIN / 20개 validation 분할을 그대로 사용한다. 기본 설정은 배치 64,
+5,000 optimizer step, 1,000 step마다 검증·저장, 최초 100 step 판단 CE 사전학습이다.
+기존 소규모 실험의 가중치를 이어받지 않고 새 모델을 학습한다.
+
+먼저 `prepare_task0_full.py`가 원본 revision과 에피소드 메타데이터를 검사한다.
+`/workspace/data/task0-audit-cache`의 완성된 224px RGB 캐시는 재사용하고 나머지만
+전처리한다. 전체 RGB 캐시는 약 180.8 GiB이며 상태·행동과 여유 공간이 추가로 필요하다.
+백업을 가리키는 원본 데이터 경로에는 쓰지 않는다. 원본 영상이 없거나 기존 캐시가
+불완전하면 파일을 삭제하지 않고 중단한다. 전처리 및 전체 200개 검사에 성공해야
+학습으로 넘어가므로, 캐시 준비 중 조기 학습하는 문제를 방지한다.
+
+```bash
+mkdir -p /workspace/TechnyongTurbo/logs
+unset WANDB_NAME
+nohup bash scripts/behavior_2026/run_task0_full_staged.sh > /workspace/TechnyongTurbo/logs/task0-staged-full-b64-5000.log 2>&1 < /dev/null &
+tail -f /workspace/TechnyongTurbo/logs/task0-staged-full-b64-5000.log
+```
+
+기존 소규모 학습은 종료한 뒤 새 학습을 시작한다. `tail -f`는 Ctrl+C로 종료해도
+백그라운드 작업은 계속된다. 서버 워크로드 종료·재시작까지 견디는 기능은 아니다.
+출력 폴더는 `/workspace/TechnyongTurbo/outputs/task0-staged-full-b64-5000`이다.
+같은 출력 폴더에 결과가 있으면 실행을 거부하므로 재실험에는 새 `RUN_DIR`을 지정한다.
+`STEPS`, `BATCH_SIZE`, `SAVE_EVERY`, `CACHE_ROOT`, `RUN_DIR`, `PYTHON_BIN`을 환경변수로
+바꿀 수 있다.
+
+배치 64 × 5,000 step은 320,000개의 샘플 추출이다. TRAIN 385,512 프레임에 대한
+단순 비율은 약 0.83이지만, 단계별 균등 복원 추출이므로 모든 프레임을 한 번씩
+학습하는 epoch를 뜻하지 않는다. 180개 전체 학습 에피소드가 샘플링 대상이 된다.
+동일한 검증 20개에서 오차와 이동·회전 단계 성능을 관찰한 뒤 학습량을 연장한다.
+
 full-task는 `--smoke`를 빼고 180/20의 모든 캐시가 존재하는 경로를 지정한다.
 현재 백업에서 캐시가 일부만 복원돼 있다면 전부 준비되기 전 실행하지 않는다.
-최초 본 실험은 1,000step 단기 관찰부터 시작하고 데이터·단계별 성능으로 연장 여부를
-결정한다. 이 분량은 튜닝된 권장 학습량이 아니다.
+이번 전체 데이터 실험은 5,000step으로 시작하고 검증 결과에 따라 연장을 결정한다.
+이 분량은 공식 권장 학습량이나 최적값이 아니다.
