@@ -82,16 +82,28 @@ def main():
     parser.add_argument("--cache", required=True, type=Path)
     parser.add_argument("--episodes", required=True, nargs="+", type=int)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--startup-seconds", type=float, default=10.)
     args = parser.parse_args()
+    from turbovla.data.startup import startup_frames
+    early_limit = startup_frames(args.startup_seconds)
     if args.out.exists():
         raise FileExistsError("Use a new phase report path")
     rows = []
     for eid in args.episodes:
         episode = load_episode(args.cache / f"episode_{eid:06d}")
         labels = phase_labels(episode)
+        early = labels[:early_limit]
+        moving = np.flatnonzero((early == 0) | (early == 1))
         rows.append({"episode_id": eid, "frames": len(labels),
                      "phase_counts": dict(zip(PHASES, np.bincount(labels, minlength=4).tolist())),
+                     "startup_seconds": args.startup_seconds,
+                     "startup_phase_counts": dict(zip(PHASES, np.bincount(early, minlength=4).tolist())),
+                     "first_startup_motion_seconds": float(moving[0] / 30) if len(moving) else None,
                      "transitions": np.flatnonzero(np.diff(labels) != 0).tolist()})
+        for key in ("rgb", "states", "actions", "depth"):
+            array = episode.get(key)
+            if isinstance(array, np.memmap):
+                array._mmap.close()
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps({"spec": PHASE_SPEC, "episodes": rows}, indent=2), encoding="utf-8")
     print(json.dumps(rows, indent=2))
