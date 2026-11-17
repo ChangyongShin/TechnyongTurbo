@@ -36,25 +36,6 @@ def make_policy(execute_steps=2):
 
 
 class DiagnosticTests(unittest.TestCase):
-    def test_ensemble_policy_trace_and_reset(self):
-        base = make_policy(1)
-        policy = BehaviorPolicy(base.model, base.normalizer, base.preprocessing,
-                                ensemble_window=2, ensemble_decay=0)
-        policy.trace_enabled = True
-        rgb = np.full((3, 16, 16, 3), 128, dtype=np.uint8)
-        state = np.zeros(61, dtype=np.float32)
-        policy.infer(rgb, state, 'test')
-        self.assertFalse(policy.last_trace['has_previous_action'])
-        policy.infer(rgb, state, 'test')
-        # Previous chunk's second action (.6) and current first action (.5).
-        self.assertAlmostEqual(float(policy.last_trace['action'][7]), .55, places=6)
-        self.assertAlmostEqual(float(policy.last_trace['action_delta'][7]), .05, places=6)
-        self.assertEqual(float(policy.last_trace['unfiltered_action_delta'][7]), 0)
-        policy.reset()
-        self.assertAlmostEqual(float(policy.infer(rgb, state, 'test')['action'][7]), .5)
-        with self.assertRaises(ValueError):
-            BehaviorPolicy(base.model, base.normalizer, base.preprocessing, 2, ensemble_window=2)
-
     def test_queue_trace_reset_and_identity_do_not_change_actions(self):
         a, b = make_policy(), make_policy()
         b.trace_enabled = True

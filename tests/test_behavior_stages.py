@@ -83,21 +83,6 @@ class StageTests(unittest.TestCase):
             self.assertTrue(np.isfinite(output["action"]).all())
             self.assertEqual(len(policy.last_trace["decision_probabilities"]),4)
             self.assertAlmostEqual(float(policy.last_trace["decision_probabilities"].sum()),1.,places=5)
-            # A weight-only continuation starts its own optimizer step count and
-            # records the exact source, rather than silently restarting randomly.
-            warm_out = root / "warm"
-            warm_command = command.copy()
-            warm_command[warm_command.index("--out") + 1] = str(warm_out)
-            warm_command[warm_command.index("--steps") + 1] = "1"
-            warm_command[warm_command.index("--decision-pretrain-steps") + 1] = "0"
-            warm_command += ["--warm-start", str(out / "step_3.pt")]
-            result = subprocess.run(warm_command, cwd=Path(__file__).parents[1], capture_output=True,
-                text=True, timeout=180, env=dict(os.environ, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", HF_HUB_OFFLINE="1"))
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            warm = torch.load(warm_out / "step_1.pt", map_location="cpu", weights_only=True)
-            self.assertEqual(warm["warm_start"]["source_step"], 3)
-            self.assertFalse(warm["warm_start"]["optimizer_resumed"])
-            self.assertEqual(warm["warm_start"]["initialized_keys"], [])
 
 
 if __name__ == "__main__":

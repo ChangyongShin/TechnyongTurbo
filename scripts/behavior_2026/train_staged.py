@@ -19,11 +19,6 @@ def main():
     parser.add_argument("--save-every", type=int, default=250)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--decision-pretrain-steps", type=int)
-    parser.add_argument("--warm-start", type=Path, help="Verified policy weight transfer with a fresh optimizer")
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--startup-seconds", type=float, default=10.)
-    parser.add_argument("--startup-fraction", type=float, default=0.)
-    parser.add_argument("--startup-base-weight", type=float, default=0.)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default=os.environ.get("WANDB_MODE", "online"))
     args = parser.parse_args()
@@ -45,9 +40,9 @@ def main():
             raise ValueError(f"Expected task0 episode {eid}: {path}")
         if revisions and (metadata.get("source") or {}).get("revision") not in revisions:
             raise ValueError(f"Cache revision differs from baseline: {path}")
-    warmup = args.decision_pretrain_steps if args.decision_pretrain_steps is not None else (0 if args.smoke or args.warm_start else min(100, args.steps // 10))
+    warmup = args.decision_pretrain_steps if args.decision_pretrain_steps is not None else (0 if args.smoke else min(100, args.steps // 10))
     root = Path(__file__).resolve().parents[2]
-    print(json.dumps({"fresh_initialization": args.warm_start is None, "train_ids": train_ids, "validation_ids": val_ids,
+    print(json.dumps({"fresh_initialization": True, "train_ids": train_ids, "validation_ids": val_ids,
                       "decision_pretrain_steps": warmup, "out": str(args.out)}), flush=True)
     command = [sys.executable, "-u", "-m", "turbovla.training.trainer",
                "--train", *map(str, train), "--validation", *map(str, val),
@@ -56,14 +51,8 @@ def main():
                "--group-balanced-loss", "--temporal-weight", "0.1", "--decision-weight", "0.1",
                "--decision-pretrain-steps", str(warmup), "--steps", str(args.steps),
                "--save-every", str(args.save_every), "--batch-size", str(args.batch_size),
-               "--lr", str(args.lr),
-               "--startup-seconds", str(args.startup_seconds),
-               "--startup-fraction", str(args.startup_fraction),
-               "--startup-base-weight", str(args.startup_base_weight),
                "--grad-accumulation", "1", "--device", args.device,
                "--vision-precision", "auto", "--wandb-mode", args.wandb_mode]
-    if args.warm_start:
-        command.extend(["--warm-start", str(args.warm_start)])
     subprocess.run(command, cwd=root, check=True,
                    env={**os.environ, "PYTHONPATH": str(root) + os.pathsep + os.environ.get("PYTHONPATH", "")})
 

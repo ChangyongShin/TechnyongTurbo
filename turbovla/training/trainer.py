@@ -22,11 +22,6 @@ def main():
     parser.add_argument("--decision-weight", type=float, default=.1)
     parser.add_argument("--decision-pretrain-steps", type=int, default=0)
     parser.add_argument("--temporal-weight", type=float, default=0.)
-    parser.add_argument("--startup-seconds", type=float, default=10., help="Initial demonstration window at 30Hz")
-    parser.add_argument("--startup-fraction", type=float, default=0.,
-                        help="Fraction of training draws replaced by episode/phase-balanced startup frames")
-    parser.add_argument("--startup-base-weight", type=float, default=0.,
-                        help="Extra first-action base imitation loss on startup observations")
     parser.add_argument("--reference-config", type=Path,
                         help="Baseline config.json defining a fixed action evaluation scale")
     parser.add_argument("--dinov3", required=True)
@@ -41,8 +36,6 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--vision-precision", choices=["auto", "fp32", "bf16_autocast"], default="auto")
     parser.add_argument("--initial-weights", type=Path)
-    parser.add_argument("--warm-start", type=Path,
-                        help="Transfer a BEHAVIOR policy with verified data/normalization/model contracts; fresh optimizer")
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--grad-accumulation", type=int, default=1)
     parser.add_argument("--workers", type=int, default=0)
@@ -51,12 +44,6 @@ def main():
     parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"],
                         default=os.environ.get("WANDB_MODE", "online"))
     args = parser.parse_args()
-    from turbovla.data.startup import startup_frames, StartupSampler, StartupMetrics, startup_report, startup_base_l1
-    startup_limit = startup_frames(args.startup_seconds)
-    if not np.isfinite(args.startup_fraction) or not 0 <= args.startup_fraction < 1:
-        raise ValueError("startup fraction must be finite and in [0,1)")
-    if not np.isfinite(args.startup_base_weight) or args.startup_base_weight < 0:
-        raise ValueError("startup base weight must be finite and nonnegative")
     manifest = None
     if args.split_manifest:
         if args.train or args.validation:
@@ -87,8 +74,8 @@ def main():
         raise ValueError("image size must be positive and divisible by 16")
     if min(args.steps, args.batch_size, args.horizon, args.grad_accumulation, args.save_every) < 1 or args.lr <= 0 or args.workers < 0:
         raise ValueError("steps, batch size, horizon and lr must be positive")
-    if sum(value is not None for value in (args.resume, args.initial_weights, args.warm_start)) > 1:
-        raise ValueError("Use only one of --resume, --initial-weights or --warm-start")
+    if args.resume and args.initial_weights:
+        raise ValueError("Use either --resume or --initial-weights")
     if min(args.decision_weight, args.temporal_weight) < 0:
         raise ValueError("Auxiliary loss weights must be nonnegative")
     if args.decision_pretrain_steps < 0 or (args.decision_pretrain_steps and
@@ -128,7 +115,7 @@ def main():
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     modality = "rgbd" if args.rgbd else "rgb"
     from turbovla.data.stages import PhaseDataset, PhaseBalancedSampler, PHASES, PHASE_SPEC
-    dataset_type = PhaseDataset if args.staged or args.phase_balanced or args.startup_fraction else BehaviorDataset
+    dataset_type = PhaseDataset if args.staged or args.phase_balanced else BehaviorDataset
     train_dataset = dataset_type(args.train, normalizer, preprocessing, args.horizon, modality)
     validation_dataset = dataset_type(args.validation, normalizer, preprocessing, args.horizon, modality)
     from turbovla.data.multitask import TaskBalancedSampler, reference_action_l1
@@ -136,9 +123,6 @@ def main():
     sampler = TaskBalancedSampler(train_dataset.episodes, args.seed) if args.task_balanced else None
     if args.phase_balanced:
         sampler = PhaseBalancedSampler(train_dataset, args.seed, args.task_balanced)
-    if args.startup_fraction:
-        sampler = StartupSampler(train_dataset, sampler, args.startup_seconds, args.startup_fraction,
-                                 args.seed, args.task_balanced)
     if args.task_balanced:
         training_tasks = {int(e["task_id"]) for e in train_dataset.episodes}
         validation_tasks = {int(e.get("task_id", -1)) for e in validation_dataset.episodes}
@@ -176,11 +160,6 @@ def main():
                              "group_balanced_loss": args.group_balanced_loss,
                              "decision_weight": args.decision_weight, "temporal_weight": args.temporal_weight}}
     metadata["training"]["decision_pretrain_steps"] = args.decision_pretrain_steps
-    metadata["training"].update(startup_seconds=args.startup_seconds, startup_fraction=args.startup_fraction,
-                                 startup_base_weight=args.startup_base_weight)
-    if args.startup_fraction:
-        metadata["startup_train_report"] = startup_report(train_dataset, args.startup_seconds)
-        print(json.dumps({"startup_train_report": metadata["startup_train_report"]}), flush=True)
     if args.staged or args.phase_balanced:
         metadata["phase_spec"] = PHASE_SPEC
         metadata["train_phase_counts"] = np.bincount(np.concatenate(train_dataset.labels), minlength=4).tolist()
@@ -192,15 +171,6 @@ def main():
     if reference is not None:
         metadata["reference_normalization"] = reference.to_dict()
     start_step = 0
-    if args.warm_start:
-        from turbovla.training.warm_start import load_policy_warm_start
-        from turbovla.evaluation.diagnostics import file_sha256
-        checkpoint = torch.load(args.warm_start, map_location="cpu", weights_only=True)
-        metadata["warm_start"] = {**load_policy_warm_start(model, checkpoint, metadata),
-                                  "checkpoint_name": args.warm_start.name,
-                                  "checkpoint_sha256": file_sha256(args.warm_start)}
-        print(json.dumps({"warm_start": metadata["warm_start"]}), flush=True)
-        del checkpoint
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
         for key in ("normalization", "preprocessing", "train_episode_ids", "validation_episode_ids"):
@@ -211,8 +181,7 @@ def main():
         if checkpoint.get("training", {}).get("task_balanced", False) != args.task_balanced:
             raise ValueError("Resume sampling strategy changed")
         for key, default in (("phase_balanced", False), ("group_balanced_loss", False),
-                             ("decision_weight", .1), ("temporal_weight", 0.), ("decision_pretrain_steps", 0),
-                             ("startup_seconds", 10.), ("startup_fraction", 0.), ("startup_base_weight", 0.)):
+                             ("decision_weight", .1), ("temporal_weight", 0.), ("decision_pretrain_steps", 0)):
             if checkpoint.get("training", {}).get(key, default) != metadata["training"][key]:
                 raise ValueError(f"Resume training objective changed: {key}")
         if checkpoint.get("phase_spec") != metadata.get("phase_spec"):
@@ -247,11 +216,6 @@ def main():
             loss = torch.stack([error[..., a:b].sum() / (mask.sum().clamp_min(1) * (b-a))
                                 for a, b in ACTION_ORDER.values()]).mean()
         control_loss = loss
-        startup_loss = torch.zeros((), device=args.device)
-        if args.startup_base_weight:
-            startup_loss = startup_base_l1(prediction, target, mask.squeeze(-1),
-                                          batch["frame_index"].to(args.device), startup_limit)
-            loss = loss + args.startup_base_weight * startup_loss
         decision_loss = torch.zeros((), device=args.device)
         if decision_logits is not None:
             decision_loss = torch.nn.functional.cross_entropy(decision_logits, batch["phase"].to(args.device))
@@ -263,7 +227,7 @@ def main():
             temporal_loss = (delta_error * pair_mask).sum() / (pair_mask.sum().clamp_min(1) * 23)
             loss = loss + args.temporal_weight * temporal_loss
         last_components.update(control_l1=float(control_loss.detach()), decision_ce=float(decision_loss.detach()),
-                               temporal_delta_l1=float(temporal_loss.detach()), startup_base_l1=float(startup_loss.detach()))
+                               temporal_delta_l1=float(temporal_loss.detach()))
         if decision_only:
             loss = decision_loss
         if not torch.isfinite(loss):
@@ -273,7 +237,7 @@ def main():
             if reference is not None:
                 reference_error = reference_action_l1(
                     prediction, batch["raw_actions"].to(args.device), mask, normalizer, reference)
-            return error.detach().sum(1), mask.sum(1).squeeze(-1), reference_error, decision_logits, prediction[:, 0].detach()
+            return error.detach().sum(1), mask.sum(1).squeeze(-1), reference_error, decision_logits
         return loss, error.detach().sum((0, 1)), mask.sum().detach()
 
     from contextlib import nullcontext
@@ -306,8 +270,7 @@ def main():
             model.vision_encoder.backbone.eval()
             optimizer.zero_grad(set_to_none=True)
             logged_loss = 0.0
-            components = {"control_l1": 0., "decision_ce": 0., "temporal_delta_l1": 0., "startup_base_l1": 0.}
-            startup_draws, batch_draws = 0, 0
+            components = {"control_l1": 0., "decision_ce": 0., "temporal_delta_l1": 0.}
             for _ in range(args.grad_accumulation):
                 try:
                     batch = next(iterator)
@@ -318,8 +281,6 @@ def main():
                 for name in components:
                     components[name] += last_components[name] / args.grad_accumulation
                 sampled_tasks.update(batch["task_id"].tolist())
-                startup_draws += int((batch["frame_index"] < startup_limit).sum())
-                batch_draws += len(batch["frame_index"])
                 (loss / args.grad_accumulation).backward()
                 logged_loss += loss.item() / args.grad_accumulation
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
@@ -328,13 +289,11 @@ def main():
                 run.log({"train_step": step, "train/l1": components["control_l1"], "train/loss_total": logged_loss,
                          **{f"train/{name}": value for name, value in components.items()},
                          "train/lr": optimizer.param_groups[0]["lr"],
-                         "train/startup_sample_fraction": startup_draws / batch_draws,
                          **{f"train/task_{task:03d}_sample_fraction": n / sum(sampled_tasks.values())
                             for task, n in sampled_tasks.items()}})
             if step == 1 or step % 50 == 0:
                 print(json.dumps({"step": step, "train_l1": components["control_l1"], "loss_total": logged_loss,
                                   "decision_only": args.staged and step <= args.decision_pretrain_steps,
-                                  "startup_sample_fraction": startup_draws / batch_draws,
                                   **components}), flush=True)
             if step % args.save_every == 0 or step == args.steps:
                 model.eval()
@@ -343,14 +302,9 @@ def main():
                 by_task = {}
                 phase_totals = {i: [torch.zeros(23, device=args.device), torch.zeros((), device=args.device)] for i in range(4)}
                 confusion = torch.zeros(4, 4, dtype=torch.long, device=args.device)
-                startup_metrics = StartupMetrics()
                 with torch.inference_mode():
                     for batch in validation:
-                        error, valid, reference_error, decision_logits, first_prediction = loss_for(batch, details=True)
-                        early = batch["frame_index"] < startup_limit
-                        if early.any():
-                            raw_prediction = normalizer.inverse_action(first_prediction.float().cpu().numpy())
-                            startup_metrics.update(raw_prediction[early.numpy()], batch["raw_actions"][:, 0].numpy()[early.numpy()])
+                        error, valid, reference_error, decision_logits = loss_for(batch, details=True)
                         total += error.sum(0)
                         count += valid.sum()
                         if "phase" in batch:
@@ -374,14 +328,6 @@ def main():
                 values = (total / count).cpu().tolist()
                 print(json.dumps({"step": step, "validation_l1_per_action": values}), flush=True)
                 task_metrics = {}
-                startup_result = startup_metrics.result()
-                print(json.dumps({"step": step, "startup_validation": startup_result}), flush=True)
-                for name in ("motion_recall", "motion_precision", "false_motion_rate", "samples"):
-                    if startup_result.get(name) is not None:
-                        task_metrics[f"validation/startup/{name}"] = startup_result[name]
-                for name in ("base_raw_l1_per_axis", "hold_base_raw_l1_per_axis"):
-                    for axis, value in enumerate(startup_result.get(name, [])):
-                        task_metrics[f"validation/startup/{name}_{axis}"] = value
                 for phase, (phase_error, phase_count) in phase_totals.items():
                     if phase_count.item() > 0:
                         per_axis = phase_error / phase_count

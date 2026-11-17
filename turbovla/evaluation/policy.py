@@ -12,7 +12,7 @@ from turbovla.data.preprocessing import Normalizer, preprocess_views
 
 
 class BehaviorPolicy:
-    def __init__(self, model, normalizer, preprocessing, execute_steps=1, *, ensemble_window=1, ensemble_decay=1.0):
+    def __init__(self, model, normalizer, preprocessing, execute_steps=1):
         if not 1 <= execute_steps <= model.chunk_size:
             raise ValueError("execute_steps must be between one and the predicted horizon")
         if model.action_dim != 23 or model.state_dim != 61 or model.num_views != 3:
@@ -22,12 +22,6 @@ class BehaviorPolicy:
         self.preprocessing = preprocessing
         self.input_channels = model.config.vision.input_channels
         self.execute_steps = execute_steps
-        from turbovla.evaluation.temporal import JointTemporalEnsemble
-        if ensemble_window > 1 and execute_steps != 1:
-            raise ValueError("Temporal ensembling requires execute_steps=1 (one new chunk per control step)")
-        self.ensemble = JointTemporalEnsemble(model.chunk_size, ensemble_window, ensemble_decay)
-        self._previous_action = None
-        self._previous_unfiltered = None
         self.queue = deque()
         self.trace_enabled = False
         self.last_trace = None
@@ -36,16 +30,12 @@ class BehaviorPolicy:
 
     def reset(self):
         self.queue.clear()
-        self.ensemble.reset()
-        self._previous_action = None
-        self._previous_unfiltered = None
         self.last_trace = None
         self._trace_chunk = None
         self._chunk_index = 0
 
     @classmethod
-    def from_checkpoint(cls, path, device="cuda", execute_steps=1, *, dinov3=None, bert=None,
-                        ensemble_window=1, ensemble_decay=1.0):
+    def from_checkpoint(cls, path, device="cuda", execute_steps=1, *, dinov3=None, bert=None):
         import torch
         from copy import deepcopy
         from turbovla.models import build_turbovla
@@ -62,8 +52,7 @@ class BehaviorPolicy:
         model = build_turbovla(config)
         loaded = model.load_state_dict(checkpoint["model"], strict=True)
         model.to(device)
-        policy = cls(model, Normalizer(**checkpoint["normalization"]), checkpoint["preprocessing"], execute_steps,
-                     ensemble_window=ensemble_window, ensemble_decay=ensemble_decay)
+        policy = cls(model, Normalizer(**checkpoint["normalization"]), checkpoint["preprocessing"], execute_steps)
         policy.deployment_metadata = {
             "checkpoint_name": Path(path).name,
             "checkpoint_sha256": file_sha256(path), "step": checkpoint.get("step"),
@@ -75,7 +64,6 @@ class BehaviorPolicy:
             "train_episode_ids": checkpoint.get("train_episode_ids"),
             "validation_episode_ids": checkpoint.get("validation_episode_ids"),
             "horizon": model.chunk_size, "execute_steps": execute_steps,
-            "ensemble_window": ensemble_window, "ensemble_decay": ensemble_decay,
             "eval_mode": not model.training, "weights_key": "model", "ema_selected": False,
             "missing_keys": list(loaded.missing_keys), "unexpected_keys": list(loaded.unexpected_keys),
         }
@@ -120,16 +108,10 @@ class BehaviorPolicy:
                                           for i, value in enumerate(rgb)})
                 if decision_probabilities is not None:
                     self._trace_chunk["decision_probabilities"] = decision_probabilities
-        unfiltered = np.asarray(self.queue.popleft(), dtype=np.float32)
-        action = self.ensemble.update(actions) if self.ensemble.window > 1 else unfiltered.copy()
+        action = np.asarray(self.queue.popleft(), dtype=np.float32)
         if self.trace_enabled:
             self.last_trace = {**self._trace_chunk, "request_state_raw": np.asarray(state).copy(),
                                "replanned": np.asarray(replanned), "chunk_index": np.asarray(self._chunk_index),
-                               "action": action.copy(), "unfiltered_action": unfiltered.copy(),
-                               "has_previous_action": np.asarray(self._previous_action is not None),
-                               "action_delta": action - self._previous_action if self._previous_action is not None else np.zeros(23, dtype=np.float32),
-                               "unfiltered_action_delta": unfiltered - self._previous_unfiltered if self._previous_unfiltered is not None else np.zeros(23, dtype=np.float32)}
-        self._previous_action = action.copy()
-        self._previous_unfiltered = unfiltered.copy()
+                               "action": action.copy()}
         self._chunk_index += 1
         return {"action": action}

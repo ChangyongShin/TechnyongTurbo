@@ -115,10 +115,6 @@ def main():
     parser.add_argument("--bert")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--execute-steps", type=int, default=1)
-    parser.add_argument("--ensemble-window", type=int, default=1,
-                        help="Overlapping chunks to average for trunk/arms; 1 disables (requires execute-steps=1)")
-    parser.add_argument("--ensemble-decay", type=float, default=1.0,
-                        help="Nonnegative age decay; larger values favor newer predictions")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--rgb-keys", nargs=3, default=RGB_KEYS)
@@ -129,8 +125,7 @@ def main():
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     policy = BehaviorPolicy.from_checkpoint(args.checkpoint, args.device, args.execute_steps,
-                                            dinov3=args.dinov3, bert=args.bert,
-                                            ensemble_window=args.ensemble_window, ensemble_decay=args.ensemble_decay)
+                                            dinov3=args.dinov3, bert=args.bert)
     server = PolicyServer(policy, load_tasks(args.data_root), args.rgb_keys, args.state_key, args.depth_keys)
     if args.trace_dir:
         from turbovla.evaluation.diagnostics import TraceWriter

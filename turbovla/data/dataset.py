@@ -82,8 +82,6 @@ class BehaviorDataset:
             "instruction": data["instruction"],
             "task_id": int(np.asarray(data.get("task_id", -1)).item()),
             "raw_actions": chunk,
-            "frame_index": t,
-            "episode_id": int(data["episode_id"]),
         }
 
 
