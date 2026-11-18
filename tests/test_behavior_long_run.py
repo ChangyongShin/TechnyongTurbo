@@ -46,7 +46,7 @@ class LongRunTests(unittest.TestCase):
 
     def test_resume_preserves_training_settings_and_total_step(self):
         saved = checkpoint()
-        settings = runner.baseline_settings(saved, 100000)
+        settings = runner.resume_settings(saved, 100000)
         self.assertEqual(settings['additional_steps'], 87952)
         self.assertEqual(settings['batch_size'], 32)
         command = runner.training_command(self.args(), saved, settings, '--augmentation {none,color}')
@@ -65,30 +65,46 @@ class LongRunTests(unittest.TestCase):
 
     def test_supported_on_preaugmentation_trainer(self):
         saved = checkpoint()
-        command = runner.training_command(self.args(), saved, runner.baseline_settings(saved, 100000), '')
+        command = runner.training_command(self.args(), saved, runner.resume_settings(saved, 100000), '')
         self.assertNotIn('--augmentation', command)
 
-    def test_rejects_staged_and_changed_objectives(self):
+    def test_staged_resume_preserves_original_5000_recipe(self):
         saved = checkpoint()
+        saved['step'] = 5000
         saved['model_config']['action']['decision_conditioning'] = True
-        with self.assertRaisesRegex(ValueError, 'staged'):
-            runner.baseline_settings(saved, 100000)
-        for key in ('task_balanced', 'phase_balanced', 'group_balanced_loss', 'temporal_weight', 'decision_pretrain_steps'):
-            saved = checkpoint()
-            saved['training'][key] = 1
-            with self.assertRaises(ValueError): runner.baseline_settings(saved, 100000)
+        saved['training'].update(batch_size=64, phase_balanced=True, group_balanced_loss=True,
+                                 temporal_weight=.1, decision_weight=.1, decision_pretrain_steps=100)
+        settings = runner.resume_settings(saved, 100000)
+        self.assertEqual(settings['additional_steps'], 95000)
+        help_text = '--staged --phase-balanced --group-balanced-loss --temporal-weight --decision-weight --decision-pretrain-steps'
+        command = runner.training_command(self.args(), saved, settings, help_text)
+        for flag in ('--staged', '--phase-balanced', '--group-balanced-loss'):
+            self.assertIn(flag, command)
+        for key, value in [('--batch-size', '64'), ('--lr', '0.0001'), ('--temporal-weight', '0.1'),
+                           ('--decision-weight', '0.1'), ('--decision-pretrain-steps', '100')]:
+            self.assertEqual(command[command.index(key)+1], value)
+        with self.assertRaisesRegex(ValueError, 'compatible code tree'):
+            runner.training_command(self.args(), saved, settings, '')
+
+    def test_rejects_new_startup_objective_and_unsupported_augmentation(self):
+        saved = checkpoint()
+        saved['training']['startup_fraction'] = .25
+        with self.assertRaisesRegex(ValueError, 'original step_5000'):
+            runner.resume_settings(saved, 100000)
         saved = checkpoint()
         saved['training']['augmentation'] = 'color'
-        with self.assertRaisesRegex(ValueError, 'unaugmented'): runner.baseline_settings(saved, 100000)
+        settings = runner.resume_settings(saved, 100000)
+        with self.assertRaisesRegex(ValueError, 'compatible code tree'):
+            runner.training_command(self.args(), saved, settings, '')
 
     def test_rejects_missing_optimizer_or_overlapping_split_or_finished_target(self):
         saved = checkpoint()
         del saved['optimizer']
-        with self.assertRaisesRegex(ValueError, 'Optimizer'): runner.baseline_settings(saved, 100000)
+        with self.assertRaisesRegex(ValueError, 'Optimizer'): runner.resume_settings(saved, 100000)
         saved = checkpoint()
         saved['validation_episode_ids'][0] = 0
-        with self.assertRaisesRegex(ValueError, 'split'): runner.baseline_settings(saved, 100000)
-        with self.assertRaisesRegex(ValueError, 'exceed'): runner.baseline_settings(checkpoint(), 12048)
+        with self.assertRaisesRegex(ValueError, 'split'): runner.resume_settings(saved, 100000)
+        with self.assertRaisesRegex(ValueError, 'exceed'): runner.resume_settings(checkpoint(), 12048)
 
 
 if __name__ == '__main__':

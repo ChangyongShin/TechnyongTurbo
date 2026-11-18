@@ -1,6 +1,7 @@
-"""Resume the original RGB task-0 baseline, preparing persistent caches first.
+"""Resume a saved RGB task-0 policy, preparing persistent caches first.
 
-This launcher does not modify model/trainer code or enable staged objectives.
+This launcher preserves the checkpoint's architecture and training objectives.
+Run staged checkpoints in their compatible code tree, not a rolled-back model.
 --steps is the TOTAL optimizer step, including the checkpoint's existing steps.
 """
 import argparse
@@ -8,39 +9,35 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
 
-def baseline_settings(checkpoint, steps):
+def resume_settings(checkpoint, steps):
     if 'optimizer' not in checkpoint:
-        raise ValueError('Optimizer state is missing; this launcher requires a baseline optimizer resume')
+        raise ValueError('Optimizer state is missing; this launcher requires an optimizer resume')
     start = int(checkpoint['step'])
     if steps <= start:
         raise ValueError('--steps must exceed the existing checkpoint step')
     config, training = checkpoint['model_config'], checkpoint['training']
-    if config['action'].get('decision_conditioning', False):
-        raise ValueError('Use the original task0-batch32-epoch1 checkpoint, not the staged active_policy model')
-    for flag in ('task_balanced', 'phase_balanced', 'group_balanced_loss'):
-        if training.get(flag, False):
-            raise ValueError(f'Not the original baseline: {flag}')
-    if training.get('temporal_weight', 0) or training.get('decision_pretrain_steps', 0):
-        raise ValueError('Auxiliary objectives differ from the original baseline')
     if checkpoint.get('modality', 'rgb') != 'rgb':
-        raise ValueError('This launcher expects the original RGB baseline')
-    if training.get('augmentation', 'none') != 'none':
-        raise ValueError('Choose the unaugmented task0-batch32-epoch1 baseline')
+        raise ValueError('This launcher expects an RGB policy')
+    if training.get('startup_fraction', 0) or training.get('startup_base_weight', 0):
+        raise ValueError('Choose the original step_5000.pt, not the later startup-sampling experiment')
     if (config['action']['action_dim'], config['action']['state_dim'], config['vision']['num_views']) != (23, 61, 3):
         raise ValueError('Expected the R1Pro 23-action / 61-state / 3-camera contract')
     train, val = checkpoint['train_episode_ids'], checkpoint['validation_episode_ids']
     if len(train) != 180 or len(val) != 20 or len(set(train + val)) != 200 or set(train + val) != set(range(200)):
         raise ValueError('Expected the original disjoint 180/20 task0 split')
     if not config['vision'].get('frozen', True):
-        raise ValueError('This launcher preserves the original frozen-vision baseline')
+        raise ValueError('This launcher preserves the saved frozen-vision recipe')
     return {'start_step': start, 'target_step': steps, 'additional_steps': steps - start,
             'batch_size': int(training['batch_size']), 'lr': float(training['lr']),
             'grad_accumulation': int(training['grad_accumulation']), 'workers': int(training.get('workers', 0)),
-            'seed': int(checkpoint['seed'])}
+            'seed': int(checkpoint['seed']),
+            'staged': bool(config['action'].get('decision_conditioning', False)),
+            'saved_training': dict(training)}
 
 
 def training_command(args, checkpoint, settings, help_text):
@@ -57,8 +54,24 @@ def training_command(args, checkpoint, settings, help_text):
                '--image-size', str(checkpoint['preprocessing']['size']),
                '--vision-precision', config['vision']['compute_precision'],
                '--save-every', str(args.save_every), '--device', 'cuda', '--wandb-mode', args.wandb_mode]
-    if '--augmentation' in help_text:
-        command += ['--augmentation', 'none']
+    training = checkpoint['training']
+    for option, enabled in [('--staged', settings['staged']),
+                            ('--task-balanced', training.get('task_balanced', False)),
+                            ('--phase-balanced', training.get('phase_balanced', False)),
+                            ('--group-balanced-loss', training.get('group_balanced_loss', False))]:
+        if enabled:
+            if option not in help_text:
+                raise ValueError(f'Checkpoint requires {option}; use its compatible code tree')
+            command.append(option)
+    for option, key, default in [('--decision-weight', 'decision_weight', .1),
+                                  ('--temporal-weight', 'temporal_weight', 0.),
+                                  ('--decision-pretrain-steps', 'decision_pretrain_steps', 0),
+                                  ('--augmentation', 'augmentation', 'none')]:
+        value = training.get(key, default)
+        if option in help_text:
+            command += [option, str(value)]
+        elif value != default:
+            raise ValueError(f'Checkpoint requires {option}={value}; use its compatible code tree')
     return command
 
 
@@ -79,7 +92,8 @@ def check_cache(folder, eid, source, instruction, load_episode):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--checkpoint', type=Path, default=Path('/workspace/TechnyongTurbo/outputs/task0-batch32-epoch1/step_12048.pt'))
+    parser.add_argument('--checkpoint', type=Path, default=Path('/input/Technyong_TurboVLA/active_policy/step_5000.pt'))
+    parser.add_argument('--expected-sha256', help='Refuse a checkpoint whose bytes differ from the selected policy')
     parser.add_argument('--data-root', type=Path, default=Path('/workspace/data/behavior-2026-rgb'))
     parser.add_argument('--cache', type=Path, default=Path('/input/Technyong_TurboVLA/caches/task0-rgb-224'))
     parser.add_argument('--out', type=Path, required=True)
@@ -100,23 +114,26 @@ def main():
     sys.path.insert(0, str(project))
     env = {**os.environ, 'PYTHONPATH': str(project) + os.pathsep + os.environ.get('PYTHONPATH', ''), 'PYTHONUNBUFFERED': '1'}
     if not args.checkpoint.is_file():
-        raise FileNotFoundError(f'Original baseline checkpoint is missing: {args.checkpoint}')
+        raise FileNotFoundError(f'Selected checkpoint is missing: {args.checkpoint}')
     import torch
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
-    settings = baseline_settings(checkpoint, args.steps)
+    settings = resume_settings(checkpoint, args.steps)
     from turbovla.models.configuration import TurboVLAConfig
     config = checkpoint['model_config']
+    action_config = {'action_dim': 23, 'state_dim': 61, 'horizon': config['action']['horizon']}
+    if settings['staged']:
+        action_config['decision_conditioning'] = True
     expected = TurboVLAConfig.from_mapping({
         'text': {'model_name_or_path': str(args.bert or config['text']['model_name_or_path']), 'local_files_only': True},
         'vision': {'model_name_or_path': str(args.dinov3 or config['vision']['model_name_or_path']),
                    'num_views': 3, 'input_channels': 3, 'image_size': checkpoint['preprocessing']['size'],
                    'frozen': True, 'local_files_only': True, 'compute_precision': config['vision']['compute_precision']},
-        'action': {'action_dim': 23, 'state_dim': 61, 'horizon': config['action']['horizon']}})
+        'action': action_config})
     normalized = TurboVLAConfig.from_mapping(config).to_dict()
     normalized['text']['model_name_or_path'] = expected.text.model_name_or_path
     normalized['vision']['model_name_or_path'] = expected.vision.model_name_or_path
     if normalized != expected.to_dict():
-        raise ValueError('Current trainer architecture defaults do not match the baseline; nothing trained')
+        raise ValueError('Current trainer architecture defaults do not match the checkpoint; nothing trained')
     for directory in (expected.vision.model_name_or_path, expected.text.model_name_or_path):
         if not Path(directory).is_dir():
             raise FileNotFoundError(f'Local pretrained model directory is missing: {directory}')
@@ -131,6 +148,8 @@ def main():
     with args.checkpoint.open('rb') as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             digest.update(block)
+    if args.expected_sha256 and digest.hexdigest() != args.expected_sha256.lower():
+        raise ValueError('Checkpoint SHA-256 differs from the selected 5,000-step policy; nothing trained')
     settings.update(checkpoint=str(args.checkpoint), checkpoint_sha256=digest.hexdigest(), cache=str(args.cache), out=str(args.out),
                     source=source, instruction=instruction, save_every=args.save_every,
                     model_changes=False, optimizer_resumed=True)
@@ -146,6 +165,18 @@ def main():
     if args.wandb_mode == 'online':
         import wandb
         wandb.login()  # Fail before expensive preparation if this terminal has no authentication.
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = args.out.parent / f'source_step_{settings["start_step"]}.pt'
+    if not snapshot.exists():
+        shutil.copyfile(args.checkpoint, snapshot)
+    snapshot_digest = hashlib.sha256()
+    with snapshot.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            snapshot_digest.update(block)
+    if snapshot_digest.hexdigest() != digest.hexdigest():
+        raise ValueError('Source snapshot differs; choose a fresh output parent directory')
+    command[command.index('--resume') + 1] = str(snapshot)
+    print(json.dumps({'resume_snapshot': str(snapshot), 'sha256': snapshot_digest.hexdigest()}), flush=True)
     from turbovla.data.dataset import load_episode, training_normalizer
     missing = []
     all_ids = checkpoint['train_episode_ids'] + checkpoint['validation_episode_ids']
