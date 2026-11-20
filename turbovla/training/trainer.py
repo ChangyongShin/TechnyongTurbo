@@ -37,6 +37,13 @@ def main():
     parser.add_argument("--vision-precision", choices=["auto", "fp32", "bf16_autocast"], default="auto")
     parser.add_argument("--initial-weights", type=Path)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--finetune", type=Path, help="Verified full policy transfer with a fresh optimizer; steps count new updates")
+    parser.add_argument("--transition-fraction", type=float, default=0.)
+    parser.add_argument("--transition-window", type=int, default=15)
+    parser.add_argument("--transition-quiet-frames", type=int, default=15)
+    parser.add_argument("--velocity-mask-probability", type=float, default=0.,
+                        help="TRAIN only: set raw base velocities state[0:3] to physical zero before normalization")
+    parser.add_argument("--visual-augmentation", choices=["none", "mild"], default="none")
     parser.add_argument("--grad-accumulation", type=int, default=1)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--save-every", type=int, default=500)
@@ -74,8 +81,12 @@ def main():
         raise ValueError("image size must be positive and divisible by 16")
     if min(args.steps, args.batch_size, args.horizon, args.grad_accumulation, args.save_every) < 1 or args.lr <= 0 or args.workers < 0:
         raise ValueError("steps, batch size, horizon and lr must be positive")
-    if args.resume and args.initial_weights:
-        raise ValueError("Use either --resume or --initial-weights")
+    if sum(bool(p) for p in (args.resume, args.initial_weights, args.finetune)) > 1:
+        raise ValueError("Use only one of --resume, --initial-weights, --finetune")
+    if not (0 <= args.transition_fraction <= 1 and 0 <= args.velocity_mask_probability <= 1):
+        raise ValueError("Intervention probabilities must be in [0, 1]")
+    if min(args.transition_window, args.transition_quiet_frames) < 1:
+        raise ValueError("Transition window and quiet duration must be positive")
     if min(args.decision_weight, args.temporal_weight) < 0:
         raise ValueError("Auxiliary loss weights must be nonnegative")
     if args.decision_pretrain_steps < 0 or (args.decision_pretrain_steps and
@@ -116,13 +127,20 @@ def main():
     modality = "rgbd" if args.rgbd else "rgb"
     from turbovla.data.stages import PhaseDataset, PhaseBalancedSampler, PHASES, PHASE_SPEC
     dataset_type = PhaseDataset if args.staged or args.phase_balanced else BehaviorDataset
-    train_dataset = dataset_type(args.train, normalizer, preprocessing, args.horizon, modality)
+    train_dataset = dataset_type(args.train, normalizer, preprocessing, args.horizon, modality,
+                                 velocity_mask_probability=args.velocity_mask_probability,
+                                 visual_augmentation=args.visual_augmentation)
     validation_dataset = dataset_type(args.validation, normalizer, preprocessing, args.horizon, modality)
     from turbovla.data.multitask import TaskBalancedSampler, reference_action_l1
     from turbovla.data.preprocessing import Normalizer
     sampler = TaskBalancedSampler(train_dataset.episodes, args.seed) if args.task_balanced else None
     if args.phase_balanced:
         sampler = PhaseBalancedSampler(train_dataset, args.seed, args.task_balanced)
+    if args.transition_fraction:
+        from turbovla.data.interventions import TransitionMixtureSampler
+        sampler = TransitionMixtureSampler(train_dataset, sampler, args.transition_fraction, args.seed,
+                                           args.transition_window, args.transition_quiet_frames)
+        print(json.dumps({"train_departure_events": [len(events) for events in sampler.events]}), flush=True)
     if args.task_balanced:
         training_tasks = {int(e["task_id"]) for e in train_dataset.episodes}
         validation_tasks = {int(e.get("task_id", -1)) for e in validation_dataset.episodes}
@@ -154,12 +172,18 @@ def main():
                 "modality": modality, "depth_preprocessing": {"encoding": "m", "clip": [0.01, 10.0],
                                                             "scale": 10.0} if args.rgbd else None,
                 "action_order": ACTION_ORDER, "seed": args.seed,
+                "code_commit": os.environ.get("TURBOVLA_CODE_COMMIT"),
                 "training": {"batch_size": args.batch_size, "grad_accumulation": args.grad_accumulation,
                              "lr": args.lr, "workers": args.workers,
                              "task_balanced": args.task_balanced, "phase_balanced": args.phase_balanced,
                              "group_balanced_loss": args.group_balanced_loss,
                              "decision_weight": args.decision_weight, "temporal_weight": args.temporal_weight}}
     metadata["training"]["decision_pretrain_steps"] = args.decision_pretrain_steps
+    default_interventions = dict(transition_fraction=0., transition_window=15, transition_quiet_frames=15,
+                                velocity_mask_probability=0., visual_augmentation="none", velocity_mask_space="raw_zero")
+    interventions = {key: getattr(args, key) if hasattr(args, key) else value
+                     for key, value in default_interventions.items()}
+    metadata["training"]["interventions"] = interventions
     if args.staged or args.phase_balanced:
         metadata["phase_spec"] = PHASE_SPEC
         metadata["train_phase_counts"] = np.bincount(np.concatenate(train_dataset.labels), minlength=4).tolist()
@@ -171,8 +195,22 @@ def main():
     if reference is not None:
         metadata["reference_normalization"] = reference.to_dict()
     start_step = 0
+    if args.finetune:
+        from turbovla.training.transfer import verify_finetune_contract
+        from turbovla.evaluation.diagnostics import file_sha256
+        checkpoint = torch.load(args.finetune, map_location="cpu", weights_only=True)
+        verify_finetune_contract(checkpoint, metadata)
+        model.load_state_dict(checkpoint["model"], strict=True)
+        metadata["finetune_source"] = {"path": str(args.finetune), "sha256": file_sha256(args.finetune),
+                                       "step": int(checkpoint["step"]), "optimizer": "fresh"}
+        print(json.dumps({"finetune_source": metadata["finetune_source"], "new_updates": args.steps}), flush=True)
+        del checkpoint
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
+        if "finetune_source" in checkpoint:
+            metadata["finetune_source"] = checkpoint["finetune_source"]
+        if checkpoint.get("training", {}).get("interventions", default_interventions) != interventions:
+            raise ValueError("Resume TRAIN interventions changed; use --finetune for a new experiment")
         for key in ("normalization", "preprocessing", "train_episode_ids", "validation_episode_ids"):
             if checkpoint[key] != metadata[key]:
                 raise ValueError(f"Resume contract changed: {key}")
@@ -253,6 +291,7 @@ def main():
                        [str(p) for p in v] if isinstance(v, list) else v
                        for k, v in vars(args).items()},
                     "train_episode_ids": train_ids, "validation_episode_ids": val_ids,
+                    "code_commit": metadata["code_commit"], "finetune_source": metadata.get("finetune_source"),
                     "start_step": start_step, "resolved_precision": precision,
                     "effective_batch_size": args.batch_size * args.grad_accumulation},
         )

@@ -52,7 +52,10 @@ def load_episode(path):
 
 
 class BehaviorDataset:
-    def __init__(self, paths, normalizer, preprocessing, horizon=12, modality="rgb"):
+    def __init__(self, paths, normalizer, preprocessing, horizon=12, modality="rgb", *,
+                 velocity_mask_probability=0., visual_augmentation="none"):
+        if not 0 <= velocity_mask_probability <= 1 or visual_augmentation not in ("none", "mild"):
+            raise ValueError("Invalid TRAIN intervention settings")
         self.episodes = [load_episode(Path(p)) for p in paths]
         if any(episode["modality"] != modality for episode in self.episodes):
             raise ValueError(f"All caches must match the requested {modality} modality")
@@ -63,6 +66,8 @@ class BehaviorDataset:
         self.preprocessing = preprocessing
         self.horizon = horizon
         self.modality = modality
+        self.velocity_mask_probability = velocity_mask_probability
+        self.visual_augmentation = visual_augmentation
 
     def __len__(self):
         return int(self.ends[-1])
@@ -74,10 +79,16 @@ class BehaviorDataset:
         t = index - (int(self.ends[e - 1]) if e else 0)
         data = self.episodes[e]
         chunk, mask = action_chunk(data["actions"], t, self.horizon)
+        rgb, state = data["rgb"][t], data["states"][t]
+        from turbovla.data.interventions import mask_base_velocity, mild_photometric
+        if self.velocity_mask_probability:
+            state = mask_base_velocity(state, self.velocity_mask_probability)
+        if self.visual_augmentation == "mild":
+            rgb = mild_photometric(rgb)
         depth = {"depth": data["depth"][t], "depth_encoding": "m"} if self.modality == "rgbd" else {}
         return {
-            "images": preprocess_views(data["rgb"][t], **self.preprocessing, **depth),
-            "state": self.normalizer.state(data["states"][t]),
+            "images": preprocess_views(rgb, **self.preprocessing, **depth),
+            "state": self.normalizer.state(state),
             "actions": self.normalizer.action(chunk), "mask": mask,
             "instruction": data["instruction"],
             "task_id": int(np.asarray(data.get("task_id", -1)).item()),
