@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 SOURCE = '/input/Technyong_TurboVLA/task0-staged-100k-20261118-134121/checkpoints/step_100000.pt'
-SOURCE_SHA256 = '893af2ed4b44bd89a6c1ad105db628fe99d64542a8e69c0deca62febbeff9359'
+SOURCE_SHA256 = '893af2ed4b44bd89a6c1ad105db628fe99d64542a8e69cd0eca62febbeff9359'
 MODES = {
     'control': (0., 0., 'none'),
     'transition': (.25, 0., 'none'),
@@ -64,7 +64,8 @@ def main():
     from turbovla.evaluation.diagnostics import file_sha256
     digest = file_sha256(args.checkpoint)
     if digest != args.expected_sha256.lower():
-        raise ValueError('Source SHA differs from the report; no training started')
+        raise ValueError(f'Source SHA mismatch for {args.checkpoint}: '
+                         f'expected {args.expected_sha256.lower()}, actual {digest}; no training started')
     import torch
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
     from scripts.behavior_2026.train_task0_long import check_cache, resume_settings
